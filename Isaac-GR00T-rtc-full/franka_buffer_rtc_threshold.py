@@ -905,8 +905,8 @@ def main():
     parser.add_argument("--action-duration", type=float, default=0.017,
                         help="每个动作执行时间（秒）")
     parser.add_argument("--task", default="Catch duck")
-    parser.add_argument("--min-queue-threshold", type=int, default=19,
-                        help="队列帧数降至此阈值时触发新推理（默认10帧，预留推理期间的缓冲）")
+    parser.add_argument("--min-queue-threshold", type=int, default=20,
+                        help="队列帧数降至此阈值时触发新推理（默认20帧，预留推理期间的缓冲）")
     
     # EEF 位姿（可选）
     parser.add_argument("--use-eef-pose", action="store_true",
