@@ -915,8 +915,8 @@ def main():
     # RTC (Real-Time Chunking)
     # parser.add_argument("--rtc", action="store_true",
     #                     help="启用 Real-Time Chunking (RTC)，使相邻 chunk 边界平滑过渡")
-    parser.add_argument("--rtc-freeze-steps", type=int, default=15,
-                        help="RTC 冻结步数。-1=冻结所有剩余步(H-s)；0=不冻结(禁用RTC约束)；"
+    parser.add_argument("--rtc-freeze-steps", type=int, default=20,
+                        help="RTC 冻结步数。-1=冻结所有剩余步(H-s)；0=不冻结(禁用推理RTC)；"
                              "正整数=冻结指定步数(不超过H-s)。推荐值: H-s 或 (H-s)//2")
     parser.add_argument("--rtc-beta", type=float, default=5.0,
                         help="RTC 引导权重裁剪值 β (Eq. 2)。设为 0 则退化为仅 hard replacement。"
