@@ -23,10 +23,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=$NUM_GPUS --master
   --save-steps 10000 \
   --max-steps 200000 \
   --warmup-ratio 0.08 \
-  --global-batch-size 192 \
+  --global-batch-size 64 \
   --learning-rate 8e-5 \
   --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
-  --dataloader-num-workers 4 \
+  --dataloader-num-workers 1 \
   --training-rtc-max-latency 24 \
   --use-wandb \
   > /workspace1/train_full.log 2>&1
