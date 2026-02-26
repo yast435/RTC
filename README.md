@@ -35,7 +35,7 @@
     *   **推理部分 (`get_action` 函数)**: 增加了对 `rtc_params` 的支持，允许在生成动作时应用 RTC 混合策略（如 Beta 权重融合、Mask 衰减）。
 
 5.  **`franka_buffer_rtc_threshold.py`** (位于根目录)
-    *   新增/修改的推理脚本，实现了具体的 RTC 推理循环，包括 Buffer 管理、Chunk 拼接和 RTC 参数控制（`--rtc-freeze-steps`, `--rtc-beta` 等）。
+    *   新增/修改的Franka推理脚本，实现了具体的 RTC 推理循环，包括 Buffer 管理、Chunk 拼接和 RTC 参数控制（`--rtc-freeze-steps`, `--rtc-beta` 等）,供参考。
 
 6.  **`gr00t/policy/rtc_policy.py`**
     *   新增文件，提供了 `RTCPolicyWrapper`，用于封装策略以支持 RTC 参数的传递。
