@@ -105,26 +105,6 @@ The standard formula adds a term proportional to $(\mathbf{Y} - \widehat{\mathbf
 In our code, `grad` is the gradient of the loss $\nabla \mathcal{L}$. Since we want to **minimize** the loss, we move in the **negative** gradient direction.
 Thus: $+ (\mathbf{Y} - \widehat{\mathbf{A}}) \dots \equiv - \nabla \mathcal{L}$.
 
-#### 6. Weight Schedule ($w(\tau)$)
-The guidance strength is dynamically adjusted during the diffusion process:
-
-$$
-w(\tau) = \min \left(\beta, \frac{1-\tau}{\tau}\right)
-$$
-
-- **Early stage ($\tau \to 0$)**: The term $\frac{1-\tau}{\tau}$ approaches infinity, so we clamp it to a maximum value $\beta$ (default `rtc_beta=5.0`) to prevent gradient explosion.
-- **Late stage ($\tau \to 1$)**: The guidance strength naturally decays to 0, allowing the model to refine local details without interference.
-
-#### 5. Soft Mask ($\mathbf{W}$)
-The weight matrix $\mathbf{W}$ uses an exponential decay schedule to prioritize continuity at the immediate next step:
-
-$$
-\mathbf{W}_k = \exp\left(-\frac{\lambda \cdot k}{\max(K-1, 1)}\right), \quad k \in [0, K-1]
-$$
-
-- $K$: Length of the frozen prefix.
-- $\lambda$: Decay rate (default `rtc_mask_decay=2.0`).
-
 ## Comparison with Standard RTC
 
 While derived from the same principles as [Standard Inference-Time RTC](https://arxiv.org/abs/2506.07339), GR00T N1.6 introduces engineering optimizations:
