@@ -54,57 +54,14 @@ $$
 **Note:** In implementation, we do not explicitly construct the Jacobian matrix $\frac{\partial \widehat{\mathbf{A}}_t^1}{\partial \mathbf{A}_t^\tau}$. Instead, we compute the vector-Jacobian product directly via `torch.autograd.grad`, which is computationally efficient (equivalent to one backward pass).
 
 **Equivalence Proof:**
-Let the error term be:
-
-$$
-\mathbf{e} = \widehat{\mathbf{A}}_t^1 - \mathbf{Y}
-$$
-
-The loss is defined as:
-
-$$
-\mathcal{L} = \frac{1}{2} \mathbf{e}^\top \operatorname{diag}(\mathbf{W}) \mathbf{e}
-$$
-
+Let the error term be $\mathbf{e} = (\widehat{\mathbf{A}}_t^1 - \mathbf{Y})$. The loss is $\mathcal{L} = \frac{1}{2} \mathbf{e}^\top \text{diag}(\mathbf{W}) \mathbf{e}$.
 By the chain rule, the gradient of $\mathcal{L}$ with respect to the input $\mathbf{A}_t^\tau$ is:
-
 $$
-\nabla_{\mathbf{A}_t^\tau} \mathcal{L}
-=
-\frac{\partial \mathcal{L}}{\partial \widehat{\mathbf{A}}_t^1}
-\cdot
-\frac{\partial \widehat{\mathbf{A}}_t^1}{\partial \mathbf{A}_t^\tau}
+\nabla_{\mathbf{A}_t^\tau} \mathcal{L} = \frac{\partial \mathcal{L}}{\partial \widehat{\mathbf{A}}_t^1} \cdot \frac{\partial \widehat{\mathbf{A}}_t^1}{\partial \mathbf{A}_t^\tau}
 $$
-
-The first term is the weighted error vector:
-
-$$
-\frac{\partial \mathcal{L}}{\partial \widehat{\mathbf{A}}_t^1}
-=
-\operatorname{diag}(\mathbf{W})
-(\widehat{\mathbf{A}}_t^1 - \mathbf{Y})
-$$
-
-The second term is the Jacobian matrix:
-
-$$
-\mathbf{J}
-=
-\frac{\partial \widehat{\mathbf{A}}_t^1}{\partial \mathbf{A}_t^\tau}
-$$
-
-Therefore, the full gradient becomes:
-
-$$
-\nabla_{\mathbf{A}_t^\tau} \mathcal{L}
-=
-\operatorname{diag}(\mathbf{W})
-(\widehat{\mathbf{A}}_t^1 - \mathbf{Y})
-\cdot
-\mathbf{J}
-$$
-
-Thus, the gradient computed by autograd is mathematically identical to the matrix product used in the RTC formula.
+The first term is exactly the weighted error vector: $\frac{\partial \mathcal{L}}{\partial \widehat{\mathbf{A}}_t^1} = (\widehat{\mathbf{A}}_t^1 - \mathbf{Y})^\top \text{diag}(\mathbf{W})$.
+The second term is the Jacobian matrix.
+Thus, $\nabla_{\mathbf{A}_t^\tau} \mathcal{L}$ computed by autograd is mathematically identical to the matrix product in the RTC formula.
 
 #### 5. Mapping to Standard RTC Formula
 
