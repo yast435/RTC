@@ -469,14 +469,26 @@ class Gr00tN1d6ActionHead(nn.Module):
                     # Gradient of guidance loss w.r.t. input actions
                     grad = torch.autograd.grad(loss, actions_g)[0]
 
-                # Guidance weight: w(τ) = min(β, (1−τ) / (τ · r₀²)), r₀=1
-                # At τ=0 the raw value is infinite → clipped to β.  (Eq. 2)
-                if tau < 1e-8:
-                    w = rtc_beta
-                else:
-                    w = min(rtc_beta, (1.0 - tau) / tau)
+                # ── Guidance weight (Eq. 2 from RTC paper) ──────────────────
+                # w(τ) = min(β, (1−τ) / (τ · r_τ²))
+                # where r_τ² = (1−τ)² / ((1−τ)² + τ²)
+                # so 1/r_τ² = ((1−τ)² + τ²) / (1−τ)²
+                # Full: w(τ) = min(β, (1−τ)/τ · ((1−τ)² + τ²) / (1−τ)²)
+                tau_t = torch.as_tensor(tau, device=device, dtype=dtype)
+                one_minus_tau = 1.0 - tau_t
+                # inv_r2 = 1/r_τ²  (correction factor from optimal transport)
+                inv_r2 = torch.nan_to_num(
+                    (one_minus_tau ** 2 + tau_t ** 2) / (one_minus_tau ** 2),
+                    posinf=rtc_beta,
+                )
+                c = torch.nan_to_num(
+                    one_minus_tau / tau_t,
+                    posinf=rtc_beta,
+                )
+                w = torch.nan_to_num(c * inv_r2, posinf=rtc_beta)
+                w = torch.minimum(w, torch.as_tensor(rtc_beta, device=device, dtype=dtype)).item()
 
-                # Euler step + guidance correction
+                # Euler step + guidance correction (single step!)
                 actions = actions + dt * pred_velocity.detach() - w * grad.detach()
             else:
                 # ── Standard Euler step (no guidance) ───────────────────────
@@ -485,7 +497,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                         actions, timesteps_tensor, embodiment_id,
                         state_features, vl_embeds, backbone_output,
                     )
-            actions = actions + dt * pred_velocity
+                actions = actions + dt * pred_velocity
 
             # ── RTC hard replacement: overwrite frozen portion with OT
             #    interpolant to *guarantee* exact convergence at τ=1. ────────
