@@ -197,74 +197,16 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
-        B, T_act, _ = actions.shape
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(B, device=actions.device, dtype=actions.dtype)  # (B,)
+        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        t = t[:, None, None]  # shape (B,1,1) for broadcast
 
-        # velocity target is always action - noise, independent of t
+        noisy_trajectory = (1 - t) * noise + t * actions
         velocity = actions - noise
 
-        # ── Training-Time RTC ────────────────────────────────────────────────
-        # Reference: Algorithm 1 in https://arxiv.org/abs/2512.05964
-        #
-        # Core idea: simulate inference delay by treating the first L actions
-        # as a known "prefix" (already executed).  For prefix tokens we set
-        # time = 1.0 (= clean data in flow matching) so that x_t = action.
-        # Loss is only computed on the remaining "postfix" tokens.
-        #
-        # Two timestep tensors are maintained:
-        #   t_encoder  – per-token (B, T), fed to action_encoder so each token
-        #                gets the correct sinusoidal time embedding.
-        #   t_dit      – scalar (B,), fed to DiT's AdaLayerNorm (global cond.).
-        # ─────────────────────────────────────────────────────────────────────
-        t_encoder = None  # Will be set to (B, T) if RTC is active
-
-        if self.training and getattr(self.config, "training_rtc_max_latency", 0) > 0:
-            max_latency = min(
-                getattr(self.config, "training_rtc_max_latency", 8), T_act
-            )
-            if max_latency <= 0:
-                # max_latency=0 means no prefix → fall through to standard path
-                max_latency = 0
-            # Sample L ~ U[0, max_latency) per paper pseudocode (exclusive upper bound)
-            # Guard: when max_latency==0, skip RTC entirely for this batch
-            L = torch.randint(0, max(max_latency, 1), (B,), device=device) if max_latency > 0 else torch.zeros(B, dtype=torch.long, device=device)
-
-            # prefix_mask: (B, T), True for positions < L (frozen prefix)
-            seq_idx = torch.arange(T_act, device=device)[None, :]  # (1, T)
-            prefix_mask = seq_idx < L[:, None]                      # (B, T)
-            prefix_mask_3d = prefix_mask.unsqueeze(-1)              # (B, T, 1)
-
-            # Per-token time: prefix → 1.0 (clean), suffix → sampled t
-            # Paper: time = jnp.where(prefix_mask, 1.0, time[:, None])
-            t_per_token = torch.where(
-                prefix_mask,
-                torch.ones(1, device=device, dtype=t.dtype),
-                t[:, None].expand(-1, T_act),
-            )  # (B, T)
-
-            # Noisy trajectory with per-token time
-            # Paper: x_t = time[:,:,None] * action_chunk + (1 - time[:,:,None]) * noise
-            t_expanded = t_per_token.unsqueeze(-1)  # (B, T, 1)
-            noisy_trajectory = t_expanded * actions + (1.0 - t_expanded) * noise
-
-            # Loss only on postfix
-            action_input.action_mask = action_input.action_mask * (~prefix_mask_3d)
-
-            # Discretized per-token time for action_encoder
-            t_encoder = (t_per_token * self.num_timestep_buckets).long()  # (B, T)
-        else:
-            # Standard (non-RTC): scalar time broadcast
-            noisy_trajectory = t[:, None, None] * actions + (1.0 - t[:, None, None]) * noise
-
-        # DiT global timestep – always scalar (B,)
-        t_dit = (t * self.num_timestep_buckets).long()
-
-        # Action encoder timestep – per-token (B, T) when RTC, else scalar (B,)
-        if t_encoder is None:
-            t_encoder = t_dit
-
-        action_features = self.action_encoder(noisy_trajectory, t_encoder, embodiment_id)
+        # Convert (continuous) t -> discrete if needed
+        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -283,7 +225,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_dit,
+                timestep=t_discretized,
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
@@ -293,7 +235,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_dit,
+                timestep=t_discretized,
                 return_all_hidden_states=True,
             )
 
@@ -527,14 +469,26 @@ class Gr00tN1d6ActionHead(nn.Module):
                     # Gradient of guidance loss w.r.t. input actions
                     grad = torch.autograd.grad(loss, actions_g)[0]
 
-                # Guidance weight: w(τ) = min(β, (1−τ) / (τ · r₀²)), r₀=1
-                # At τ=0 the raw value is infinite → clipped to β.  (Eq. 2)
-                if tau < 1e-8:
-                    w = rtc_beta
-                else:
-                    w = min(rtc_beta, (1.0 - tau) / tau)
+                # ── Guidance weight (Eq. 2 from RTC paper) ──────────────────
+                # w(τ) = min(β, (1−τ) / (τ · r_τ²))
+                # where r_τ² = (1−τ)² / ((1−τ)² + τ²)
+                # so 1/r_τ² = ((1−τ)² + τ²) / (1−τ)²
+                # Full: w(τ) = min(β, (1−τ)/τ · ((1−τ)² + τ²) / (1−τ)²)
+                tau_t = torch.as_tensor(tau, device=device, dtype=dtype)
+                one_minus_tau = 1.0 - tau_t
+                # inv_r2 = 1/r_τ²  (correction factor from optimal transport)
+                inv_r2 = torch.nan_to_num(
+                    (one_minus_tau ** 2 + tau_t ** 2) / (one_minus_tau ** 2),
+                    posinf=rtc_beta,
+                )
+                c = torch.nan_to_num(
+                    one_minus_tau / tau_t,
+                    posinf=rtc_beta,
+                )
+                w = torch.nan_to_num(c * inv_r2, posinf=rtc_beta)
+                w = torch.minimum(w, torch.as_tensor(rtc_beta, device=device, dtype=dtype)).item()
 
-                # Euler step + guidance correction
+                # Euler step + guidance correction (single step!)
                 actions = actions + dt * pred_velocity.detach() - w * grad.detach()
             else:
                 # ── Standard Euler step (no guidance) ───────────────────────
@@ -543,7 +497,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                         actions, timesteps_tensor, embodiment_id,
                         state_features, vl_embeds, backbone_output,
                     )
-            actions = actions + dt * pred_velocity
+                actions = actions + dt * pred_velocity
 
             # ── RTC hard replacement: overwrite frozen portion with OT
             #    interpolant to *guarantee* exact convergence at τ=1. ────────
@@ -588,18 +542,6 @@ class Gr00tN1d6ActionHead(nn.Module):
             frozen_prefix=frozen_prefix,
             rtc_params=rtc_params,
         )
-
-    @property
-    def device(self):
-        return next(iter(self.parameters())).device
-
-    @property
-    def dtype(self):
-        return next(iter(self.parameters())).dtype
-
-    def prepare_input(self, batch: dict) -> BatchFeature:
-        """Prepare input batch for the action head."""
-        return BatchFeature(data=batch)
 
 
 def get_backbone_cls(config: Gr00tN1d6Config):
