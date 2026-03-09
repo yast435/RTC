@@ -133,4 +133,3 @@ In the standard RTC formulation, $r_\tau^2 = \frac{(1-\tau)^2}{\tau^2 + (1-\tau)
 
 ---
 *Implementation Reference: `gr00t/model/gr00t_n1d6/gr00t_n1d6.py` (Methods: `get_action_with_features`, `_denoise_step_forward`)*
-

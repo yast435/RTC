@@ -511,10 +511,13 @@ class Gr00tN1d6ActionHead(nn.Module):
 
             # ── RTC hard replacement: overwrite frozen portion with OT
             #    interpolant to *guarantee* exact convergence at τ=1. ────────
-            if K > 0 and noise_frozen is not None:
-                actions[:, :K, :] = (
-                    (1.0 - tau_next) * noise_frozen
-                    + tau_next * frozen_prefix[:, :K, :]
+            # Only hard-replace the first d steps (inevitable delay region).
+            # The overlap region beyond d is left to soft guidance only.
+            replace_k = min(K, fixed_delay_steps) if K > 0 else 0
+            if replace_k > 0 and noise_frozen is not None:
+                actions[:, :replace_k, :] = (
+                    (1.0 - tau_next) * noise_frozen[:, :replace_k, :]
+                    + tau_next * frozen_prefix[:, :replace_k, :]
                 )
 
         return BatchFeature(

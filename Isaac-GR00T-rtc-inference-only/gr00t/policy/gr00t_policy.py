@@ -348,6 +348,7 @@ class Gr00tPolicy(BasePolicy):
                 rtc_params = {
                     "beta": rtc.get("beta", 5.0),
                     "mask_decay": rtc.get("mask_decay", 2.0),
+                    "fixed_delay_steps": rtc.get("fixed_delay_steps", 0),
                 }
 
         # frozen_prefix: numpy (K,D) or (B,K,D) -> torch (B,K,D)
