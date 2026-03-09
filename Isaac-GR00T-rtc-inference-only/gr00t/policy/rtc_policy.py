@@ -100,6 +100,9 @@ class RTCPolicyWrapper(PolicyWrapper):
         """
         if options is None:
             options = {}
+            
+        # Get estimated delay from options (passed from client)
+        estimated_delay = options.get("estimated_delay_steps", 0)
 
         # Build frozen prefix from the *unexecuted tail* of the previous chunk.
         if self._prev_normalized_pred is not None:
@@ -111,6 +114,7 @@ class RTCPolicyWrapper(PolicyWrapper):
                 options["rtc"]["frozen_prefix"] = tail
                 options["rtc"]["beta"] = self.rtc_beta
                 options["rtc"]["mask_decay"] = self.rtc_mask_decay
+                options["rtc"]["fixed_delay_steps"] = estimated_delay
 
         # Forward to the inner policy (which forwards to the model).
         action, info = self.policy.get_action(observation, options)

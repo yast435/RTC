@@ -92,7 +92,6 @@ class FrankaGr00tChunkClient(Node):
         use_eef_pose: bool = False,
         # RTC (Real-Time Chunking)
         rtc_enabled: bool = False,
-        rtc_freeze_steps: int = -1,
         rtc_beta: float = 5.0,
         rtc_mask_decay: float = 2.0,
     ):
@@ -109,10 +108,12 @@ class FrankaGr00tChunkClient(Node):
         
         # RTC (Real-Time Chunking) 状态
         self.rtc_enabled = rtc_enabled
-        self.rtc_freeze_steps = rtc_freeze_steps  # -1=全冻结, 0=不冻结, >0=冻结指定步数
         self.rtc_beta = rtc_beta          # 引导权重裁剪 (Eq. 2)
         self.rtc_mask_decay = rtc_mask_decay  # Soft mask 指数衰减率 (Eq. 5)
         self._rtc_prev_normalized_pred = None  # 上一次推理的归一化预测 (B, H, D)
+        
+        # 延迟缓冲区（用于动态计算 RTC d）
+        self.delay_history = deque(maxlen=10)
         
         # 数据缓冲区
         self.left_joint_state = None
@@ -535,23 +536,17 @@ class FrankaGr00tChunkClient(Node):
         H = self._rtc_prev_normalized_pred.shape[1]  # 上一次 chunk 的总步数
         consumed = max(0, H - current_queue_size)  # 已消耗步数
 
-        # 剩余部分对应 normalized_pred[:, consumed:, :]
+        # 传递整个未执行的剩余部分作为 frozen_prefix
+        # 模型内部通过 fixed_delay_steps 区分硬冻结（d 步）和软引导（其余）
         remaining = self._rtc_prev_normalized_pred[:, consumed:, :]  # (B, queue_size, D)
-        available = remaining.shape[1]
-
-        if self.rtc_freeze_steps < 0:
-            K = available
-        elif self.rtc_freeze_steps == 0:
-            K = 0
-        else:
-            K = min(self.rtc_freeze_steps, available)
+        K = remaining.shape[1]
 
         if K > 0:
-            frozen = remaining[:, :K, :]  # (B, K, D)
+            frozen = remaining  # (B, K, D)
             if not hasattr(self, '_rtc_logged'):
                 self.get_logger().info(
                     f"[RTC] frozen_prefix: K={K} 步 "
-                    f"(已消耗 {consumed}, 可用 {available}, 设置 {self.rtc_freeze_steps}), "
+                    f"(已消耗 {consumed}), "
                     f"beta={self.rtc_beta}, mask_decay={self.rtc_mask_decay}"
                 )
                 self._rtc_logged = True
@@ -564,12 +559,35 @@ class FrankaGr00tChunkClient(Node):
                 }
             }
         return None
+
+    def _estimate_delay_steps(self):
+        """估计当前的 Inference Delay (d) 对应的步数"""
+        if not self.delay_history:
+            return 1 # 初始保守估计
+            
+        # 策略：取最近 N 次推理的最大耗时（保守策略），或者平均值
+        # 论文建议保守估计，避免还没生成完就要执行了
+        max_latency_ms = max(self.delay_history)
+        
+        # 转换为步数: ceil(latency / action_duration)
+        # 注意：latency 是毫秒，action_duration 是秒
+        latency_sec = max_latency_ms / 1000.0
+        steps = int(np.ceil(latency_sec / self.action_duration))
+        
+        # 加上一定的缓冲（例如 1-2 步）以应对网络抖动
+        steps += 1 
+        
+        return steps
     
     def _run_inference(self, obs, rtc_options):
         """执行单次推理调用（可在后台线程安全运行）"""
         inference_start = time.time()
         action, info = self.groot_client.get_action(obs, rtc_options)
         inference_time = (time.time() - inference_start) * 1000
+        
+        # 记录耗时
+        self.delay_history.append(inference_time)
+        
         return action, info, inference_time
 
     # ==================== 独立发布线程 ====================
@@ -761,14 +779,8 @@ class FrankaGr00tChunkClient(Node):
         else:
             self.get_logger().info("[EEF] 未启用位姿输入（使用零向量）")
         if self.rtc_enabled:
-            freeze_desc = (
-                f"全冻结(剩余)" if self.rtc_freeze_steps < 0
-                else f"不冻结" if self.rtc_freeze_steps == 0
-                else f"{self.rtc_freeze_steps} 步"
-            )
             self.get_logger().info(
-                f"[RTC] 已启用 Real-Time Chunking，"
-                f"freeze={freeze_desc}，"
+                f"[RTC] 已启用 Real-Time Chunking（动态延迟感知），"
                 f"beta={self.rtc_beta}，mask_decay={self.rtc_mask_decay}"
             )
         else:
@@ -825,6 +837,11 @@ class FrankaGr00tChunkClient(Node):
                         continue
 
                     rtc_options = self._build_rtc_options(queue_before)
+                    
+                    # 动态估计 delay 并注入
+                    if rtc_options and "rtc" in rtc_options:
+                        estimated_d = self._estimate_delay_steps()
+                        rtc_options["estimated_delay_steps"] = estimated_d
 
                     # ═══════════ 4. 执行推理（发布线程继续运行！） ═══════════
                     action, info, inference_time = self._run_inference(obs, rtc_options)
@@ -914,11 +931,9 @@ def main():
                         help="启用 EEF 位姿输入（订阅 /left/franka/eef_pose, /right/franka/eef_pose）")
     
     # RTC (Real-Time Chunking)
-    # parser.add_argument("--rtc", action="store_true",
-    #                     help="启用 Real-Time Chunking (RTC)，使相邻 chunk 边界平滑过渡")
-    parser.add_argument("--rtc-freeze-steps", type=int, default=15,
-                        help="RTC 冻结步数。-1=冻结所有剩余步(H-s)；0=不冻结(禁用RTC约束)；"
-                             "正整数=冻结指定步数(不超过H-s)。推荐值: H-s 或 (H-s)//2")
+    parser.add_argument("--rtc", action="store_true",
+                        help="启用 Real-Time Chunking (RTC)，使相邻 chunk 边界平滑过渡。"
+                             "硬冻结步数由推理延迟动态决定。")
     parser.add_argument("--rtc-beta", type=float, default=5.0,
                         help="RTC 引导权重裁剪值 β (Eq. 2)。设为 0 则退化为仅 hard replacement。"
                              "推荐值: 5.0")
@@ -937,8 +952,7 @@ def main():
             task_description=args.task,
             min_queue_threshold=args.min_queue_threshold,
             use_eef_pose=args.use_eef_pose,
-            rtc_enabled=(args.rtc_freeze_steps != 0),
-            rtc_freeze_steps=args.rtc_freeze_steps,
+            rtc_enabled=args.rtc,
             rtc_beta=args.rtc_beta,
             rtc_mask_decay=args.rtc_mask_decay,
         )

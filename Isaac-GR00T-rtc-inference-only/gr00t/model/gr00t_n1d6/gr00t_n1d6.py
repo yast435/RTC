@@ -385,6 +385,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             rtc_params = {}
         rtc_beta: float = rtc_params.get("beta", 5.0)
         rtc_mask_decay: float = rtc_params.get("mask_decay", 2.0)
+        fixed_delay_steps: int = rtc_params.get("fixed_delay_steps", 0)
 
         vl_embeds = backbone_features
 
@@ -432,8 +433,17 @@ class Gr00tN1d6ActionHead(nn.Module):
         soft_mask = None
         if use_guidance and K > 0:
             idx = torch.arange(K, device=device, dtype=dtype)
+            
+            # Mask Logic:
+            # First 'fixed_delay_steps' steps are considered "past/inevitable" (d in paper) -> Mask = 1.0
+            # Subsequent steps are "overlap/future" -> Exponential decay
+            
+            decay_idx = torch.clamp(idx - fixed_delay_steps, min=0)
+            # Avoid division by zero if K <= fixed_delay_steps
+            decay_len = max(K - fixed_delay_steps - 1, 1)
+            
             soft_mask = torch.exp(
-                -rtc_mask_decay * idx / max(K - 1, 1)
+                -rtc_mask_decay * decay_idx / decay_len
             )  # shape (K,)
             soft_mask = soft_mask[None, :, None]  # (1, K, 1) for broadcast
 
@@ -469,15 +479,27 @@ class Gr00tN1d6ActionHead(nn.Module):
                     # Gradient of guidance loss w.r.t. input actions
                     grad = torch.autograd.grad(loss, actions_g)[0]
 
-                # Guidance weight: w(τ) = min(β, (1−τ) / (τ · r₀²)), r₀=1
-                # At τ=0 the raw value is infinite → clipped to β.  (Eq. 2)
+                # ── Guidance weight ──────────────────────────────────────────
+                # Note: GR00T uses a *squared-loss* gradient formulation:
+                #   grad = ∂/∂x [ (soft_mask · (x̂₀ - frozen)²).sum() ]
+                # The gradient already contains the error magnitude (diff)
+                # via chain rule, making it self-amplifying.
+                #
+                # The full paper formula w(τ) = (1−τ)/(τ·r_τ²) with the
+                # 1/r_τ² OT correction was derived for LeRobot's *linear*
+                # JVP formulation (grad = J^T · err).  Applying it here
+                # would over-constrain because the squared-loss gradient
+                # is already ~2x stronger in magnitude.
+                #
+                # We use the simpler w(τ) = min(β, (1−τ)/τ) which provides
+                # the correct τ-dependent scaling for this loss formulation.
                 if tau < 1e-8:
                     w = rtc_beta
                 else:
                     w = min(rtc_beta, (1.0 - tau) / tau)
 
-                # Euler step + guidance correction
-                actions = actions + dt * pred_velocity.detach() - w * grad.detach()
+                # Euler step + guidance correction (single step!)
+                actions = actions + dt * (pred_velocity.detach() - w * grad.detach())
             else:
                 # ── Standard Euler step (no guidance) ───────────────────────
                 with torch.no_grad():
@@ -485,7 +507,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                         actions, timesteps_tensor, embodiment_id,
                         state_features, vl_embeds, backbone_output,
                     )
-            actions = actions + dt * pred_velocity
+                actions = actions + dt * pred_velocity
 
             # ── RTC hard replacement: overwrite frozen portion with OT
             #    interpolant to *guarantee* exact convergence at τ=1. ────────
