@@ -458,9 +458,10 @@ class Gr00tN1d6ActionHead(nn.Module):
             )
 
             if use_guidance:
-                # ── Guidance-based RTC (Algorithm 1 from the paper) ─────────
-                # We need gradients w.r.t. *actions* to compute the guidance
-                # signal, so run the forward pass inside ``enable_grad()``.
+                # ── Guidance-based RTC (Algorithm 1 / Eq. 2 from the paper) ──
+                # Uses the Vector-Jacobian Product (VJP) formulation:
+                #   g = e^T · ∂x̂₁/∂x_τ   (Eq. 2, Algorithm 1 line 27-28)
+                # where e = (Y - x̂₁) * W is the soft-masked error.
                 with torch.enable_grad():
                     actions_g = actions.detach().clone().requires_grad_(True)
 
@@ -469,37 +470,37 @@ class Gr00tN1d6ActionHead(nn.Module):
                         state_features, vl_embeds, backbone_output,
                     )
 
-                    # Predicted clean sample: x̂₀ = x_τ + (1 − τ) · v
+                    # Predicted clean sample: x̂₁ = x_τ + (1 − τ) · v
                     x0_hat = actions_g + (1.0 - tau) * pred_velocity
 
-                    # Soft-masked MSE loss on the frozen portion
-                    diff = x0_hat[:, :K, :] - frozen_prefix[:, :K, :]
-                    loss = (soft_mask * diff.pow(2)).sum()
+                    # Weighted error: e = (Y - x̂₁) · W   (Eq. 2)
+                    error = (frozen_prefix[:, :K, :] - x0_hat[:, :K, :]) * soft_mask
 
-                    # Gradient of guidance loss w.r.t. input actions
-                    grad = torch.autograd.grad(loss, actions_g)[0]
+                    # VJP: g = J^T · e, computed via autograd
+                    # We pad error to full action horizon so grad has correct shape
+                    error_padded = torch.zeros_like(x0_hat)
+                    error_padded[:, :K, :] = error
+                    g = torch.autograd.grad(
+                        outputs=x0_hat,
+                        inputs=actions_g,
+                        grad_outputs=error_padded.detach(),
+                        retain_graph=False,
+                    )[0]
 
-                # ── Guidance weight ──────────────────────────────────────────
-                # Note: GR00T uses a *squared-loss* gradient formulation:
-                #   grad = ∂/∂x [ (soft_mask · (x̂₀ - frozen)²).sum() ]
-                # The gradient already contains the error magnitude (diff)
-                # via chain rule, making it self-amplifying.
-                #
-                # The full paper formula w(τ) = (1−τ)/(τ·r_τ²) with the
-                # 1/r_τ² OT correction was derived for LeRobot's *linear*
-                # JVP formulation (grad = J^T · err).  Applying it here
-                # would over-constrain because the squared-loss gradient
-                # is already ~2x stronger in magnitude.
-                #
-                # We use the simpler w(τ) = min(β, (1−τ)/τ) which provides
-                # the correct τ-dependent scaling for this loss formulation.
-                if tau < 1e-8:
-                    w = rtc_beta
-                else:
-                    w = min(rtc_beta, (1.0 - tau) / tau)
+                # ── Guidance weight (Eq. 2) ──────────────────────────────────
+                # w(τ) = min(β, (1−τ) / (τ · r_τ²))
+                # where r_τ² = (1−τ)² / (τ² + (1−τ)²)
+                tau_t = torch.tensor(tau, dtype=torch.float64)
+                one_minus_tau = 1.0 - tau_t
+                r_tau_sq = one_minus_tau ** 2 / (tau_t ** 2 + one_minus_tau ** 2)
+                raw_w = torch.nan_to_num(
+                    one_minus_tau / (tau_t * r_tau_sq),
+                    posinf=torch.tensor(rtc_beta, dtype=torch.float64),
+                )
+                w = min(rtc_beta, raw_w.item())
 
-                # Euler step + guidance correction (single step!)
-                actions = actions + dt * (pred_velocity.detach() - w * grad.detach())
+                # Euler step with guidance correction (Eq. 1 + Eq. 2)
+                actions = actions + dt * (pred_velocity.detach() + w * g.detach())
             else:
                 # ── Standard Euler step (no guidance) ───────────────────────
                 with torch.no_grad():
