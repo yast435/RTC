@@ -94,6 +94,8 @@ class FrankaGr00tChunkClient(Node):
         rtc_enabled: bool = False,
         rtc_beta: float = 5.0,
         rtc_mask_decay: float = 2.0,
+        rtc_warmup_delay_steps: int = 4,
+        rtc_hard_freeze_mode: str = "auto",
     ):
         super().__init__('franka_groot_chunk_client')
         
@@ -110,10 +112,14 @@ class FrankaGr00tChunkClient(Node):
         self.rtc_enabled = rtc_enabled
         self.rtc_beta = rtc_beta          # 引导权重裁剪 (Eq. 2)
         self.rtc_mask_decay = rtc_mask_decay  # Soft mask 指数衰减率 (Eq. 5)
+        self.rtc_warmup_delay_steps = rtc_warmup_delay_steps
+        self.rtc_hard_freeze_mode = rtc_hard_freeze_mode
         self._rtc_prev_normalized_pred = None  # 上一次推理的归一化预测 (B, H, D)
         
         # 延迟缓冲区（用于动态计算 RTC d）
-        self.delay_history = deque(maxlen=10)
+        # 这里记录的是“单次推理期间实际又执行了多少步旧 chunk”，
+        # 而不是 wall-clock 推理耗时。这样 hard freeze 才能和实际执行步数对齐。
+        self.delay_step_history = deque(maxlen=10)
         
         # 数据缓冲区
         self.left_joint_state = None
@@ -153,7 +159,6 @@ class FrankaGr00tChunkClient(Node):
         # 每帧元素: (left_arm_7d, right_arm_7d, left_gripper_float, right_gripper_float)
         self._action_queue = deque()
         self._queue_lock = threading.Lock()
-        self._last_published_action = None  # 队列空时保持最后位置
         self._publisher_running = False
         self._total_chunk_size = 0  # 模型输出步数 H（首次推理后确定）
         
@@ -405,6 +410,9 @@ class FrankaGr00tChunkClient(Node):
                 "head": self.head_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
                 "left": self.left_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
                 "right": self.right_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
+                # "camera_head": self.head_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
+                # "camera_left": self.left_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
+                # "camera_right": self.right_images[-1][np.newaxis, np.newaxis, ...].astype(np.uint8),
             }
             return {
                 "state": state_obs, 
@@ -561,33 +569,33 @@ class FrankaGr00tChunkClient(Node):
         return None
 
     def _estimate_delay_steps(self):
-        """估计当前的 Inference Delay (d) 对应的步数"""
-        if not self.delay_history:
-            return 1 # 初始保守估计
-            
-        # 策略：取最近 N 次推理的最大耗时（保守策略），或者平均值
-        # 论文建议保守估计，避免还没生成完就要执行了
-        max_latency_ms = max(self.delay_history)
-        
-        # 转换为步数: ceil(latency / action_duration)
-        # 注意：latency 是毫秒，action_duration 是秒
-        latency_sec = max_latency_ms / 1000.0
-        steps = int(np.ceil(latency_sec / self.action_duration))
-        
-        # 加上一定的缓冲（例如 1-2 步）以应对网络抖动
-        steps += 1 
-        
-        return steps
+        """估计当前的 Inference Delay (d) 对应的步数。
+        delay_step_history 未满时使用 rtc_warmup_delay_steps 作为固定值。
+
+        这里的 d 定义为：一次推理开始后，到推理结果返回前，
+        旧 chunk 实际又被发布了多少步。由于当前推理尚未结束，
+        只能根据历史实际步数做估计。
+        """
+        if len(self.delay_step_history) < self.delay_step_history.maxlen:
+            return self.rtc_warmup_delay_steps
+
+        # 采用历史实际 delay steps 的较保守分位数估计，
+        # 比 wall-clock latency 更贴近“当前会过时多少步”这一控制语义。
+        recent_steps = np.asarray(self.delay_step_history, dtype=np.float32)
+        estimated_steps = int(np.ceil(np.percentile(recent_steps, 80)))
+        return max(0, estimated_steps)
+
+    def _resolve_hard_freeze_steps(self):
+        """根据配置决定本次 RTC 的 hard freeze 步数。"""
+        if self.rtc_hard_freeze_mode == "off":
+            return 0
+        return self._estimate_delay_steps()
     
     def _run_inference(self, obs, rtc_options):
         """执行单次推理调用（可在后台线程安全运行）"""
         inference_start = time.time()
         action, info = self.groot_client.get_action(obs, rtc_options)
         inference_time = (time.time() - inference_start) * 1000
-        
-        # 记录耗时
-        self.delay_history.append(inference_time)
-        
         return action, info, inference_time
 
     # ==================== 独立发布线程 ====================
@@ -626,7 +634,7 @@ class FrankaGr00tChunkClient(Node):
         """独立动作发布线程：以固定频率从队列消费并发布动作。
 
         该线程与推理线程完全解耦，机器人在推理期间也能继续执行动作，
-        消除 chunk 边界卡顿。队列为空时保持最后一帧位置。
+        消除 chunk 边界卡顿。队列为空时不发送额外命令，等待新 chunk。
         """
         self.get_logger().info(
             f"[发布线程] 已启动，频率={1.0/self.action_duration:.0f}Hz"
@@ -639,15 +647,12 @@ class FrankaGr00tChunkClient(Node):
             with self._queue_lock:
                 if self._action_queue:
                     action = self._action_queue.popleft()
-                    self._last_published_action = action
                     self.step_count += 1
                     queue_empty_warned = False
 
             if action is None:
-                # 队列空：保持最后位置（不抖动）
-                action = self._last_published_action
-                if not queue_empty_warned and action is not None:
-                    self.get_logger().warn("[发布线程] 队列已空，保持最后位置")
+                if not queue_empty_warned:
+                    self.get_logger().warn("[发布线程] 队列已空，等待新 chunk")
                     queue_empty_warned = True
 
             if action is not None:
@@ -673,15 +678,19 @@ class FrankaGr00tChunkClient(Node):
             val = val[0]
         return float(max(0.0, min(1.0, val)))
 
-    def _load_chunk_to_queue(self, action, info, queue_size_at_inference_start=None):
+    def _get_published_step(self) -> int:
+        """读取当前已实际发布的动作步数。"""
+        with self._queue_lock:
+            return self.step_count
+
+    def _load_chunk_to_queue(self, action, info, steps_executed_since_request: int = 0):
         """将新推理结果加载到动作队列。
 
-        核心 RTC 时序逻辑：
-        1. 推理开始时队列有 Q_before 帧（来自旧 chunk 的剩余）
-        2. 推理期间发布线程继续消费，结束时队列剩 Q_now 帧
-        3. consumed_during_inference = Q_before - Q_now
-        4. 新 chunk 的前 K 步被 RTC 约束为匹配旧 chunk 的剩余
-        5. 跳过已被消费的 consumed_during_inference 步，把剩余部分填入队列
+        推理期间发布线程会继续消费旧队列，因此这里会根据
+        推理发起后实际已发布的步数，跳过新 chunk 中已经"过时"的前缀。
+
+        如果旧队列先耗尽，则 step_count 会停止增长，此时 skip 不会继续增加，
+        新 chunk 会从尚未执行过的第一帧开始发送。
 
         Returns:
             (chunk_size, skipped): 模型输出总步数 H 和跳过的步数
@@ -714,17 +723,13 @@ class FrankaGr00tChunkClient(Node):
             rg = self._extract_gripper_value(right_gripper, i)
             new_actions.append((left_arm[i], right_arm[i], lg, rg))
 
-        # 原子替换队列：计算推理期间已消费步数并跳过
-        with self._queue_lock:
-            if queue_size_at_inference_start is not None:
-                current_queue_size = len(self._action_queue)
-                consumed_during_inference = queue_size_at_inference_start - current_queue_size
-                skip = max(0, consumed_during_inference)
-            else:
-                skip = 0
+        skip = max(0, min(int(steps_executed_since_request), H))
+        trimmed_actions = new_actions[skip:]
 
+        # 原子替换队列：保留尚未过时的新动作前缀
+        with self._queue_lock:
             self._action_queue.clear()
-            self._action_queue.extend(new_actions[skip:])
+            self._action_queue.extend(trimmed_actions)
 
         return H, skip
 
@@ -738,16 +743,16 @@ class FrankaGr00tChunkClient(Node):
         │  发布线程 (_publisher_loop)                              │
         │  ───────────────────────                                │
         │  以固定频率 1/dt 从 _action_queue 取帧并 publish。       │
-        │  队列为空时保持最后帧位置，永不停歇。                      │
+        │  队列为空时不发送新命令，等待下一次推理。                  │
         └─────────────────────────────────────────────────────────┘
         ┌─────────────────────────────────────────────────────────┐
         │  主线程 (本方法)                                         │
         │  ───────────────────                                    │
         │  while True:                                            │
         │    ① 等待队列深度降到阈值 (H - s) → 该推理了              │
-        │    ② 快照队列大小，构建观测 & RTC frozen_prefix           │
+        │    ② 记录当前已发布步数，构建观测 & RTC frozen_prefix       │
         │    ③ 阻塞式推理（期间发布线程继续消费旧 chunk）            │
-        │    ④ 将新 chunk 加载到队列（跳过推理期间已消耗的步数）      │
+        │    ④ 将新 chunk 加载到队列（按实际已发布步数做 step 对齐）  │
         └─────────────────────────────────────────────────────────┘
         """
         self.get_logger().info("=" * 60)
@@ -781,7 +786,8 @@ class FrankaGr00tChunkClient(Node):
         if self.rtc_enabled:
             self.get_logger().info(
                 f"[RTC] 已启用 Real-Time Chunking（动态延迟感知），"
-                f"beta={self.rtc_beta}，mask_decay={self.rtc_mask_decay}"
+                f"beta={self.rtc_beta}，mask_decay={self.rtc_mask_decay}，"
+                f"hard_freeze_mode={self.rtc_hard_freeze_mode}"
             )
         else:
             self.get_logger().info("[RTC] 未启用（标准 chunk 推理）")
@@ -826,29 +832,37 @@ class FrankaGr00tChunkClient(Node):
                     if not rclpy.ok():
                         break
 
-                    # ═══════════ 2. 快照队列状态 ═══════════
-                    with self._queue_lock:
-                        queue_before = len(self._action_queue)
-
-                    # ═══════════ 3. 构建观测 & RTC 选项 ═══════════
+                    # ═══════════ 2. 构建观测 ═══════════
                     obs = self.build_observation()
                     if obs is None:
                         time.sleep(0.01)
                         continue
 
-                    rtc_options = self._build_rtc_options(queue_before)
-                    
+                    # ═══════════ 3. 记录真正发起推理时刻的 step / queue ═══════════
+                    # 这两个量必须使用同一参考时刻：
+                    # frozen_prefix 从这一刻的旧 chunk 剩余部分构造，
+                    # d_actual 也以这一刻为起点统计。
+                    with self._queue_lock:
+                        step_at_request = self.step_count
+                        queue_size_for_rtc = len(self._action_queue)
+
+                    rtc_options = self._build_rtc_options(queue_size_for_rtc)
+                    estimated_d = None
+
                     # 动态估计 delay 并注入
                     if rtc_options and "rtc" in rtc_options:
-                        estimated_d = self._estimate_delay_steps()
-                        rtc_options["estimated_delay_steps"] = estimated_d
+                        estimated_d = self._resolve_hard_freeze_steps()
+                        rtc_options["rtc"]["fixed_delay_steps"] = estimated_d
 
                     # ═══════════ 4. 执行推理（发布线程继续运行！） ═══════════
                     action, info, inference_time = self._run_inference(obs, rtc_options)
 
                     # ═══════════ 5. 加载新 chunk 到队列 ═══════════
+                    step_now = self._get_published_step()
+                    steps_executed_since_request = max(0, step_now - step_at_request)
+                    self.delay_step_history.append(steps_executed_since_request)
                     chunk_size, skipped = self._load_chunk_to_queue(
-                        action, info, queue_before
+                        action, info, steps_executed_since_request
                     )
                     self.inference_count += 1
 
@@ -859,8 +873,12 @@ class FrankaGr00tChunkClient(Node):
                     self.get_logger().info(
                         f"[推理 #{self.inference_count}] "
                         f"推理={inference_time:.0f}ms "
+                        f"step={step_at_request}->{step_now} "
+                        f"d_est={estimated_d if estimated_d is not None else '-'} "
+                        f"d_actual={steps_executed_since_request} "
                         f"跳过={skipped}步 "
-                        f"队列={queue_before}→{queue_after}"
+                        f"chunk={chunk_size} "
+                        f"队列={queue_after}"
                     )
 
                     if self.save_actions:
@@ -919,27 +937,34 @@ class FrankaGr00tChunkClient(Node):
 def main():
     parser = argparse.ArgumentParser(description="Franka GR00T Chunk 模式客户端")
     parser.add_argument("--groot-host", default="localhost")
-    parser.add_argument("--groot-port", type=int, default=5555)
+    parser.add_argument("--groot-port", type=int, default=6666)
     parser.add_argument("--action-duration", type=float, default=0.017,
                         help="每个动作执行时间（秒）")
-    parser.add_argument("--task", default="Catch duck")
-    parser.add_argument("--min-queue-threshold", type=int, default=19,
+    # parser.add_argument("--task", default="Use your left arm to place the cup on the coaster quickly, and your right arm to put the spoon into the cup quickly.")
+    parser.add_argument("--task", default="Catch duck.")
+    parser.add_argument("--min-queue-threshold", type=int, default=15,
                         help="队列帧数降至此阈值时触发新推理（默认10帧，预留推理期间的缓冲）")
     
     # EEF 位姿（可选）
-    parser.add_argument("--use-eef-pose", action="store_true",
-                        help="启用 EEF 位姿输入（订阅 /left/franka/eef_pose, /right/franka/eef_pose）")
+    parser.add_argument("--use-eef-pose", type=lambda x: x.lower() == "true", default=True,
+                        help="启用 EEF 位姿输入（订阅 /left/franka/eef_pose, /right/franka/eef_pose）。设置 true/false")
     
     # RTC (Real-Time Chunking)
-    parser.add_argument("--rtc", action="store_true",
+    parser.add_argument("--rtc", type=lambda x: x.lower() == "False", default=True,
                         help="启用 Real-Time Chunking (RTC)，使相邻 chunk 边界平滑过渡。"
-                             "硬冻结步数由推理延迟动态决定。")
+                             "硬冻结步数由推理延迟动态决定。设置 true/false")
     parser.add_argument("--rtc-beta", type=float, default=5.0,
                         help="RTC 引导权重裁剪值 β (Eq. 2)。设为 0 则退化为仅 hard replacement。"
                              "推荐值: 5.0")
     parser.add_argument("--rtc-mask-decay", type=float, default=2.0,
                         help="RTC soft mask 指数衰减率 (Eq. 5)。控制冻结区域内各步的引导权重分布。"
                              "推荐值: 2.0")
+    parser.add_argument("--rtc-warmup-delay-steps", type=int, default=10,
+                        help="前 10 次推理（delay_step_history 未满）时使用的固定 delay steps。"
+                             "满 10 次后切换为动态估计。默认: 4")
+    parser.add_argument("--rtc-hard-freeze-mode", choices=["auto", "off"], default="auto",
+                        help="RTC hard freeze 模式。auto: 使用历史实际 delay steps 估计 fixed_delay_steps；"
+                             "off: 强制 fixed_delay_steps=0，仅保留 frozen_prefix + soft mask/guidance。")
     
     args = parser.parse_args()
     rclpy.init()
@@ -955,6 +980,8 @@ def main():
             rtc_enabled=args.rtc,
             rtc_beta=args.rtc_beta,
             rtc_mask_decay=args.rtc_mask_decay,
+            rtc_warmup_delay_steps=args.rtc_warmup_delay_steps,
+            rtc_hard_freeze_mode=args.rtc_hard_freeze_mode,
         )
         node.run_control_loop()
     except Exception as e:
