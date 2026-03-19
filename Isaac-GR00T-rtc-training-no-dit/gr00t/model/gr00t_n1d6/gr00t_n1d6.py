@@ -139,6 +139,64 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _sample_training_rtc_delay(
+        self,
+        batch_size: int,
+        min_latency: int,
+        max_latency_exclusive: int,
+        device,
+    ) -> torch.Tensor:
+        if max_latency_exclusive <= 0:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        max_valid_latency = max_latency_exclusive - 1
+        min_latency = max(0, min(min_latency, max_valid_latency))
+        if min_latency == max_valid_latency:
+            return torch.full((batch_size,), min_latency, dtype=torch.long, device=device)
+
+        distribution = getattr(self.config, "training_rtc_delay_distribution", "uniform")
+        if distribution == "uniform":
+            return torch.randint(min_latency, max_latency_exclusive, (batch_size,), device=device)
+
+        if distribution == "exponential":
+            temperature = max(
+                float(getattr(self.config, "training_rtc_delay_exponential_temperature", 1.0)),
+                1e-6,
+            )
+            delay_values = torch.arange(
+                min_latency, max_latency_exclusive, device=device, dtype=torch.float32
+            )
+            probs = torch.exp(-temperature * (delay_values - float(min_latency)))
+            probs = probs / probs.sum()
+            return torch.multinomial(probs, batch_size, replacement=True).to(dtype=torch.long)
+
+        if distribution == "normal":
+            delay_values = torch.arange(
+                min_latency, max_latency_exclusive, device=device, dtype=torch.float32
+            )
+            default_mean = 0.5 * (min_latency + max_valid_latency)
+            mean = float(getattr(self.config, "training_rtc_delay_normal_mean", -1.0))
+            if mean < 0:
+                mean = default_mean
+
+            default_std = max((max_valid_latency - min_latency + 1) / 6.0, 1.0)
+            std = max(
+                float(getattr(self.config, "training_rtc_delay_normal_std", -1.0)),
+                0.0,
+            )
+            if std == 0.0:
+                std = default_std
+
+            logits = -0.5 * ((delay_values - mean) / std) ** 2
+            probs = torch.exp(logits - logits.max())
+            probs = probs / probs.sum()
+            return torch.multinomial(probs, batch_size, replacement=True).to(dtype=torch.long)
+
+        raise ValueError(
+            f"Unsupported training RTC delay distribution: {distribution}. "
+            "Expected one of {'uniform', 'exponential', 'normal'}."
+        )
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -218,17 +276,19 @@ class Gr00tN1d6ActionHead(nn.Module):
         #   t_dit      – scalar (B,), fed to DiT's AdaLayerNorm (global cond.).
         # ─────────────────────────────────────────────────────────────────────
         t_encoder = None  # Will be set to (B, T) if RTC is active
+        action_mask = action_input.action_mask
 
         if self.training and getattr(self.config, "training_rtc_max_latency", 0) > 0:
             max_latency = min(
                 getattr(self.config, "training_rtc_max_latency", 8), T_act
             )
+            min_latency = max(0, int(getattr(self.config, "training_rtc_min_latency", 0)))
+            min_latency = min(min_latency, max(max_latency - 1, 0))
             if max_latency <= 0:
                 # max_latency=0 means no prefix → fall through to standard path
                 max_latency = 0
-            # Sample L ~ U[0, max_latency) per paper pseudocode (exclusive upper bound)
-            # Guard: when max_latency==0, skip RTC entirely for this batch
-            L = torch.randint(0, max(max_latency, 1), (B,), device=device) if max_latency > 0 else torch.zeros(B, dtype=torch.long, device=device)
+            # Sample L per configured delay distribution.
+            L = self._sample_training_rtc_delay(B, min_latency, max_latency, device)
 
             # prefix_mask: (B, T), True for positions < L (frozen prefix)
             seq_idx = torch.arange(T_act, device=device)[None, :]  # (1, T)
@@ -248,8 +308,9 @@ class Gr00tN1d6ActionHead(nn.Module):
             t_expanded = t_per_token.unsqueeze(-1)  # (B, T, 1)
             noisy_trajectory = t_expanded * actions + (1.0 - t_expanded) * noise
 
-            # Loss only on postfix
-            action_input.action_mask = action_input.action_mask * (~prefix_mask_3d)
+            # Loss only on postfix. Keep the masked tensor local so we do not
+            # mutate the input batch in place.
+            action_mask = action_mask * (~prefix_mask_3d)
 
             # Discretized per-token time for action_encoder
             t_encoder = (t_per_token * self.num_timestep_buckets).long()  # (B, T)
@@ -301,7 +362,6 @@ class Gr00tN1d6ActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
@@ -346,7 +406,8 @@ class Gr00tN1d6ActionHead(nn.Module):
     def _denoise_step_forward(
         self,
         actions: torch.Tensor,
-        timesteps_tensor: torch.Tensor,
+        action_timesteps_tensor: torch.Tensor,
+        dit_timesteps_tensor: torch.Tensor,
         embodiment_id: torch.Tensor,
         state_features: torch.Tensor,
         vl_embeds: torch.Tensor,
@@ -355,9 +416,9 @@ class Gr00tN1d6ActionHead(nn.Module):
         """Run a single denoising-step forward pass and return the predicted velocity.
 
         This helper is shared by the standard (no-grad) path and the
-        guidance-based (grad-enabled) path, avoiding code duplication.
+        training-time RTC sampling path.
         """
-        action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+        action_features = self.action_encoder(actions, action_timesteps_tensor, embodiment_id)
         if self.config.add_pos_embed:
             pos_ids = torch.arange(
                 action_features.shape[1], dtype=torch.long, device=actions.device
@@ -371,7 +432,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
-                timestep=timesteps_tensor,
+                timestep=dit_timesteps_tensor,
                 image_mask=backbone_output.image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
             )
@@ -379,7 +440,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
-                timestep=timesteps_tensor,
+                timestep=dit_timesteps_tensor,
             )
 
         pred = self.action_decoder(model_output, embodiment_id)
@@ -396,53 +457,27 @@ class Gr00tN1d6ActionHead(nn.Module):
         rtc_params: dict | None = None,
     ) -> BatchFeature:
         """
-        Generate actions using the flow matching diffusion process with optional RTC.
-
-        Real-Time Chunking (RTC) enables smooth transitions between consecutive
-        action chunks by constraining the beginning of the new chunk to match
-        the tail of the previous chunk (frozen_prefix).
-
-        Two RTC modes are supported (controlled via *rtc_params*):
-
-        1. **Guidance-based inpainting** (``beta > 0``, default):
-           At each denoising step the predicted clean sample x̂₀ is compared
-           against the frozen prefix, and the gradient of a soft-masked MSE
-           loss w.r.t. the noised actions is used to steer the *entire* chunk
-           toward consistency.  A hard replacement is still applied afterwards
-           to guarantee an exact match on the frozen portion.
-           This is the full algorithm described in the RTC paper (Algorithm 1).
-
-        2. **Replacement-only** (``beta == 0``):
-           The frozen portion is replaced with the correct OT interpolant
-           at each step (Diffuser-style).  Cheaper but produces slightly
-           less smooth transitions at chunk boundaries.
+        Generate actions using Training-Time RTC sampling.
 
         Reference
         ---------
-        Kevin Black, Manuel Y. Galliker, Sergey Levine.
-        "Real-Time Execution of Action Chunking Flow Policies."
-        NeurIPS 2025.  https://arxiv.org/abs/2506.07339
+        Kevin Black, Allen Z. Ren, Michael Equi, Sergey Levine.
+        "Training-Time Action Conditioning for Efficient Real-Time Chunking."
+        arXiv 2025.  https://arxiv.org/abs/2512.05964
 
         Args:
             backbone_features: [B, seq_len, backbone_embedding_dim]
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
-            frozen_prefix: [B, K, action_dim] – the first K actions of this
-                chunk are constrained to equal these values (in normalised
-                action space).  K may be smaller than action_horizon.
-                Pass None to disable RTC (standard generation).
+            frozen_prefix: Optional prefix actions in normalised action space.
             rtc_params: Optional dict with RTC hyper-parameters:
-                - beta (float, default 5.0): guidance weight clipping value.
-                    Set to 0 to fall back to replacement-only mode.
-                - mask_decay (float, default 2.0): exponential-decay rate
-                    for the soft mask over the frozen prefix.
+                - fixed_delay_steps (int, default 0): number of prefix steps
+                    to condition on during sampling.
         """
-        # ── RTC hyper-parameters ────────────────────────────────────────────
         if rtc_params is None:
             rtc_params = {}
-        rtc_beta: float = rtc_params.get("beta", 5.0)
-        rtc_mask_decay: float = rtc_params.get("mask_decay", 2.0)
+        fixed_delay_steps: int = rtc_params.get("fixed_delay_steps", 0)
 
         vl_embeds = backbone_features
 
@@ -458,10 +493,7 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
 
-        # ── RTC: prepare frozen prefix ──────────────────────────────────────
         K = 0
-        noise_frozen = None
-        use_guidance = False
         if frozen_prefix is not None:
             if frozen_prefix.dim() == 2:
                 frozen_prefix = frozen_prefix.unsqueeze(0)  # (1, K, D)
@@ -477,81 +509,47 @@ class Gr00tN1d6ActionHead(nn.Module):
                     device=frozen_prefix.device,
                 )
                 frozen_prefix = torch.cat([frozen_prefix, pad], dim=-1)
-            # Save the initial noise for the frozen portion so we can
-            # reconstruct the correct OT interpolant at every τ.
-            noise_frozen = actions[:, :K, :].clone()
-            use_guidance = K > 0 and rtc_beta > 0
+        prefix_steps = min(K, max(fixed_delay_steps, 0))
 
-        # ── Pre-compute soft mask for guidance (Eq. 5 in RTC paper) ─────────
-        # Exponential decay over the frozen prefix: actions near the start
-        # (about to be executed) get the strongest guidance; actions near the
-        # boundary with the free region get weaker guidance for a smoother
-        # transition.
-        soft_mask = None
-        if use_guidance and K > 0:
-            idx = torch.arange(K, device=device, dtype=dtype)
-            soft_mask = torch.exp(
-                -rtc_mask_decay * idx / max(K - 1, 1)
-            )  # shape (K,)
-            soft_mask = soft_mask[None, :, None]  # (1, K, 1) for broadcast
-
-        # ── Denoising loop (Euler integration of flow matching ODE) ─────────
+        # Training-Time RTC sampling: overwrite the committed prefix before
+        # each denoising step. The action encoder receives per-token timesteps,
+        # while the DiT body still receives a single global timestep.
         for t in range(self.num_inference_timesteps):
             tau = t / float(self.num_inference_timesteps)       # 0, 1/N, …
-            tau_next = (t + 1) / float(self.num_inference_timesteps)
             t_discretized = int(tau * self.num_timestep_buckets)
-
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
+            dit_timestep = torch.full(
+                size=(batch_size,),
+                fill_value=t_discretized,
+                device=device,
+                dtype=torch.long,
             )
-
-            if use_guidance:
-                # ── Guidance-based RTC (Algorithm 1 from the paper) ─────────
-                # We need gradients w.r.t. *actions* to compute the guidance
-                # signal, so run the forward pass inside ``enable_grad()``.
-                with torch.enable_grad():
-                    actions_g = actions.detach().clone().requires_grad_(True)
-
-                    pred_velocity = self._denoise_step_forward(
-                        actions_g, timesteps_tensor, embodiment_id,
-                        state_features, vl_embeds, backbone_output,
-                    )
-
-                    # Predicted clean sample: x̂₀ = x_τ + (1 − τ) · v
-                    x0_hat = actions_g + (1.0 - tau) * pred_velocity
-
-                    # Soft-masked MSE loss on the frozen portion
-                    diff = x0_hat[:, :K, :] - frozen_prefix[:, :K, :]
-                    loss = (soft_mask * diff.pow(2)).sum()
-
-                    # Gradient of guidance loss w.r.t. input actions
-                    grad = torch.autograd.grad(loss, actions_g)[0]
-
-                # Guidance weight: w(τ) = min(β, (1−τ) / (τ · r₀²)), r₀=1
-                # At τ=0 the raw value is infinite → clipped to β.  (Eq. 2)
-                if tau < 1e-8:
-                    w = rtc_beta
-                else:
-                    w = min(rtc_beta, (1.0 - tau) / tau)
-
-                # Euler step + guidance correction
-                actions = actions + dt * pred_velocity.detach() - w * grad.detach()
-            else:
-                # ── Standard Euler step (no guidance) ───────────────────────
-                with torch.no_grad():
-                    pred_velocity = self._denoise_step_forward(
-                        actions, timesteps_tensor, embodiment_id,
-                        state_features, vl_embeds, backbone_output,
-                    )
-            actions = actions + dt * pred_velocity
-
-            # ── RTC hard replacement: overwrite frozen portion with OT
-            #    interpolant to *guarantee* exact convergence at τ=1. ────────
-            if K > 0 and noise_frozen is not None:
-                actions[:, :K, :] = (
-                    (1.0 - tau_next) * noise_frozen
-                    + tau_next * frozen_prefix[:, :K, :]
+            action_timestep = dit_timestep
+            if prefix_steps > 0:
+                action_timestep = torch.full(
+                    (batch_size, self.config.action_horizon),
+                    fill_value=t_discretized,
+                    device=device,
+                    dtype=torch.long,
                 )
+                action_timestep[:, :prefix_steps] = self.num_timestep_buckets
+
+            with torch.no_grad():
+                actions_model = actions
+                if prefix_steps > 0:
+                    actions_model = actions_model.clone()
+                    actions_model[:, :prefix_steps, :] = frozen_prefix[:, :prefix_steps, :]
+                pred_velocity = self._denoise_step_forward(
+                    actions_model,
+                    action_timestep,
+                    dit_timestep,
+                    embodiment_id,
+                    state_features,
+                    vl_embeds,
+                    backbone_output,
+                )
+            actions = actions_model + dt * pred_velocity
+            if prefix_steps > 0:
+                actions[:, :prefix_steps, :] = frozen_prefix[:, :prefix_steps, :]
 
         return BatchFeature(
             data={

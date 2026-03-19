@@ -104,6 +104,11 @@ class Gr00tN1d6Config(PretrainedConfig):
     # Training-Time RTC parameters
     # When training_rtc_max_latency > 0, Training-Time RTC is automatically enabled.
     training_rtc_max_latency: int = 0  # 0 = disabled; >0 = enable RTC with this max latency
+    training_rtc_min_latency: int = 0
+    training_rtc_delay_distribution: str = "uniform"
+    training_rtc_delay_exponential_temperature: float = 1.0
+    training_rtc_delay_normal_mean: float = -1.0
+    training_rtc_delay_normal_std: float = -1.0
 
 
     def __init__(self, **kwargs):

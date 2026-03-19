@@ -119,12 +119,52 @@ class FinetuneConfig:
     When set to 0 (default), RTC is disabled.
     Reference: https://arxiv.org/abs/2512.05964
 
-    During training, a random prefix length L ~ U[0, max_latency) is sampled
-    per batch item (exclusive upper bound, matching paper pseudocode).
+    During training, a random prefix length L is sampled per batch item from
+    the configured delay distribution over [min_latency, max_latency), with
+    the upper bound kept exclusive to preserve the original paper-compatible
+    sampling behavior.
     The first L actions are treated as known (frozen) and the
     model only needs to predict actions after step L.
     Set this to ceil(max_inference_delay / control_period).
     Example: 350ms delay / 16ms period ≈ 22, so set to ~24 for safety margin.
+    """
+
+    training_rtc_min_latency: int = 0
+    """
+    Minimum simulated latency in action steps for Training-Time RTC.
+    The sampler draws delays in the range [min_latency, max_latency) after
+    clamping to the valid action horizon. Use this when real deployment
+    latency has a known lower bound.
+    """
+
+    training_rtc_delay_distribution: str = "uniform"
+    """
+    Delay sampling distribution for Training-Time RTC.
+    Supported values:
+      - "uniform": sample all delays uniformly.
+      - "exponential": bias toward shorter delays with an exponential decay.
+      - "normal": truncated discrete normal over [min_latency, max_latency).
+    """
+
+    training_rtc_delay_exponential_temperature: float = 1.0
+    """
+    Temperature for the exponential delay sampler.
+    Larger values put more probability mass on small delays.
+    Ignored when using the uniform distribution.
+    """
+
+    training_rtc_delay_normal_mean: float = -1.0
+    """
+    Mean of the truncated normal delay sampler, measured in action steps.
+    Set to a negative value to use the midpoint of [min_latency, max_latency)
+    automatically. Ignored unless using the normal distribution.
+    """
+
+    training_rtc_delay_normal_std: float = -1.0
+    """
+    Standard deviation of the truncated normal delay sampler, measured in
+    action steps. Set to a negative value to auto-derive a reasonable spread
+    from the valid latency range. Ignored unless using the normal distribution.
     """
 
     shard_size: int = 2**10

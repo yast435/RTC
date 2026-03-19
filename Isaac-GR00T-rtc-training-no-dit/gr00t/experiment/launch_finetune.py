@@ -64,6 +64,13 @@ if __name__ == "__main__":
 
     # Training-Time RTC: enabled automatically when max_latency > 0
     config.model.training_rtc_max_latency = ft_config.training_rtc_max_latency
+    config.model.training_rtc_min_latency = ft_config.training_rtc_min_latency
+    config.model.training_rtc_delay_distribution = ft_config.training_rtc_delay_distribution
+    config.model.training_rtc_delay_exponential_temperature = (
+        ft_config.training_rtc_delay_exponential_temperature
+    )
+    config.model.training_rtc_delay_normal_mean = ft_config.training_rtc_delay_normal_mean
+    config.model.training_rtc_delay_normal_std = ft_config.training_rtc_delay_normal_std
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

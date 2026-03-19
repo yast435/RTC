@@ -346,8 +346,7 @@ class Gr00tPolicy(BasePolicy):
                 frozen_prefix = rtc.get("frozen_prefix", None)
                 # Build RTC hyper-parameter dict for the model.
                 rtc_params = {
-                    "beta": rtc.get("beta", 5.0),
-                    "mask_decay": rtc.get("mask_decay", 2.0),
+                    "fixed_delay_steps": rtc.get("fixed_delay_steps", 0),
                 }
 
         # frozen_prefix: numpy (K,D) or (B,K,D) -> torch (B,K,D)
@@ -358,18 +357,8 @@ class Gr00tPolicy(BasePolicy):
             if frozen_prefix.dim() == 2:
                 frozen_prefix = frozen_prefix.unsqueeze(0)  # (1,K,D)
 
-        # Step 4: Run model inference to predict actions
-        # When RTC guidance is active (beta > 0) we need ``torch.enable_grad()``
-        # inside the denoising loop, which is incompatible with
-        # ``torch.inference_mode()``.  Fall back to the lighter
-        # ``torch.no_grad()`` context in that case.
-        use_rtc_guidance = (
-            frozen_prefix is not None
-            and rtc_params is not None
-            and rtc_params.get("beta", 5.0) > 0
-        )
-        ctx = torch.no_grad() if use_rtc_guidance else torch.inference_mode()
-        with ctx:
+        # Step 4: Run model inference to predict actions.
+        with torch.inference_mode():
             model_pred = self.model.get_action(
                 collated_inputs,
                 frozen_prefix=frozen_prefix,

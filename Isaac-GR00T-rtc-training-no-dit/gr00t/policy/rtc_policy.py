@@ -66,13 +66,9 @@ class RTCPolicyWrapper(PolicyWrapper):
         self,
         policy: BasePolicy,
         execution_horizon: int,
-        rtc_beta: float = 5.0,
-        rtc_mask_decay: float = 2.0,
     ):
         super().__init__(policy, strict=False)
         self.execution_horizon = execution_horizon
-        self.rtc_beta = rtc_beta
-        self.rtc_mask_decay = rtc_mask_decay
 
         # Internal state – cleared on ``reset()``.
         self._prev_normalized_pred: np.ndarray | None = None  # (B, H, D)
@@ -101,6 +97,10 @@ class RTCPolicyWrapper(PolicyWrapper):
         if options is None:
             options = {}
 
+        # Estimated delay can be supplied by the caller so the model can
+        # choose how many prefix steps are treated as already committed.
+        estimated_delay = options.get("estimated_delay_steps", 0)
+
         # Build frozen prefix from the *unexecuted tail* of the previous chunk.
         if self._prev_normalized_pred is not None:
             s = self.execution_horizon
@@ -109,8 +109,7 @@ class RTCPolicyWrapper(PolicyWrapper):
                 options.setdefault("rtc", {})
                 options["rtc"]["enabled"] = True
                 options["rtc"]["frozen_prefix"] = tail
-                options["rtc"]["beta"] = self.rtc_beta
-                options["rtc"]["mask_decay"] = self.rtc_mask_decay
+                options["rtc"]["fixed_delay_steps"] = estimated_delay
 
         # Forward to the inner policy (which forwards to the model).
         action, info = self.policy.get_action(observation, options)
