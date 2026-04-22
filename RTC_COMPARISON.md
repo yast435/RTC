@@ -35,7 +35,7 @@ RTC 主要加在 **推理采样过程** 里：
 
 所以它的关键工作量发生在 **推理阶段**。
 
-### 你的 `training-no-dit` 版本 Training-Time RTC
+###  `training-no-dit` 版本 Training-Time RTC
 
 RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 
@@ -83,7 +83,7 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 
 ### 不是因为它还在做 inference-time RTC guidance
 
-在你的 `training-no-dit` 版本里，`rtc_freeze_steps` **已经不是** `beta` / `mask_decay` 那种 inference-time RTC 参数了。
+在 `training-no-dit` 版本里，`rtc_freeze_steps` **已经不是** `beta` / `mask_decay` 那种 inference-time RTC 参数了。
 
 它现在本质上是：
 
@@ -102,14 +102,14 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 - 哪些动作已经属于上一 chunk 的延迟区
 - 哪些动作是这一次需要新生成的
 
-如果你在推理时完全不传 prefix，那么模型看到的就只是“从纯噪声开始生成一整段 chunk”，这已经不是 training-time RTC 想要的推理条件了。
+如果在推理时完全不传 prefix，那么模型看到的就只是“从纯噪声开始生成一整段 chunk”，这已经不是 training-time RTC 想要的推理条件了。
 
 所以：
 
 - `training-time RTC` 不需要 inference-time RTC 的 guidance
 - 但 **仍然需要 prefix 作为条件**
 
-### 你这版里它的真实含义
+### 这版里它的真实含义
 
 在 `training-no-dit` 版本中：
 
@@ -128,9 +128,9 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 - `prefix_steps_cap`
 - `max_prefix_overlap`
 
-## 6. 你的 `no-dit` 版本到底改了什么
+## 6.  `no-dit` 版本到底改了什么
 
-你的 `training-no-dit` 版本不是“完整版 training-time RTC”，而是一个 **保守版**：
+ `training-no-dit` 版本不是“完整版 training-time RTC”，而是一个 **保守版**：
 
 - 已实现：
   - training-time RTC loss
@@ -165,7 +165,7 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 - VJP guidance
 - hard replacement
 
-### 你的 `training-no-dit` 版本推理思路
+###  `training-no-dit` 版本推理思路
 
 可以理解为：
 
@@ -200,7 +200,7 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 
 - 训练时必须显式引入 delay 模拟
 - 运行效果更依赖训练分布是否覆盖真实延迟
-- 你这个 `no-dit` 版本没有改 `DiT` 主体，上限会低于“全模型都支持 per-token timestep”的版本
+- 这个 `no-dit` 版本没有改 `DiT` 主体，上限会低于“全模型都支持 per-token timestep”的版本
 
 ### Inference-Time RTC
 
@@ -218,21 +218,21 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 
 ## 9. 什么时候该用哪一个
 
-- 如果你最关心 **实时性和部署开销**：
-  优先用你的 `training-no-dit` 版本 training-time RTC。
+- 如果最关心 **实时性和部署开销**：
+  优先用 `training-no-dit` 版本 training-time RTC。
 
-- 如果你手头已经有一个没做 training-time RTC 的模型，但又想在推理时尽量把边界接平：
+- 如果手头已经有一个没做 training-time RTC 的模型，但又想在推理时尽量把边界接平：
   更适合 inference-time RTC。
 
-- 如果你愿意改训练流程，并且目标是长期部署：
+- 如果愿意改训练流程，并且目标是长期部署：
   training-time RTC 更像主路线。
 
 ## 10. 最后一句结论
 
-对于你的 `training-no-dit` 分支，可以把它理解成：
+对于 `training-no-dit` 分支，可以把它理解成：
 
 > **“用训练把 RTC 学进去，用推理时的 prefix handover 把条件喂进去，但不再在推理阶段做 inference-time guidance。”**
 
-所以你看到推理代码里仍然有 `rtc_freeze_steps`，不是因为它还在跑 inference-time RTC，而是因为：
+所以看到推理代码里仍然有 `rtc_freeze_steps`，不是因为它还在跑 inference-time RTC，而是因为：
 
 **training-time RTC 仍然需要在推理时告诉模型：哪一段 prefix 已经确定。**
