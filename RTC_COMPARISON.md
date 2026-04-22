@@ -74,7 +74,7 @@ RTC 主要加在 **训练目标** 和 **专用采样路径** 里：
 | 推理是否需要梯度 | 否，`torch.inference_mode()` 即可 | guidance 模式下通常需要 `torch.enable_grad()` / `torch.no_grad()` |
 | 推理额外开销 | 低 | 高 |
 | 边界连续性的主要来源 | 训练中学到的 prefix conditioning + 推理时 prefix overwrite | 推理时 guidance + hard replacement |
-| 是否改 `DiT` 主体 | 你的这个 `no-dit` 版本不改 | 不需要改 |
+| 是否改 `DiT` 主体 | 这个 `no-dit` 版本不改 | 不需要改 |
 | timestep 设计 | 仅 `action encoder` 做 per-token timestep，`DiT` 仍是全局 timestep | 通常全局 timestep |
 
 ## 5. 为什么 Training-Time RTC 在推理时还需要 `rtc_freeze_steps`
